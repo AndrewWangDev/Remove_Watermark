@@ -11,11 +11,12 @@ try:
 except Exception:
     pass
 
-# Helper dummy paths for Python 3.14 Tcl9 ZipFS compatibility if present
-for helper in ['_tcl_data', '_tk_data', 'tcl', 'tk']:
-    helper_path = os.path.join('build_helpers', helper)
-    if os.path.exists(helper_path):
-        datas.append((helper_path, helper))
+# Helper dummy paths only needed for Python 3.14+ Tcl9 ZipFS compatibility if present
+if sys.version_info >= (3, 14):
+    for helper in ['_tcl_data', '_tk_data', 'tcl', 'tk']:
+        helper_path = os.path.join('build_helpers', helper)
+        if os.path.exists(helper_path):
+            datas.append((helper_path, helper))
 
 a = Analysis(
     [entry_script],
@@ -47,7 +48,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,

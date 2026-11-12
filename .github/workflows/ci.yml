@@ -5,6 +5,7 @@ on:
     branches: [ main ]
     paths-ignore:
       - 'README.md'
+      - 'README.MD'
       - 'docs/**'
       - '.gitignore'
   pull_request:
@@ -14,6 +15,34 @@ permissions:
   contents: read
 
 jobs:
+  lint-and-audit:
+    name: Static Check & Dependency Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Tools & Requirements
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff pip-audit
+
+      - name: Syntax & Lint Check
+        run: |
+          python -m py_compile src/main.py src/ui/main_view.py src/logic/processor.py src/logic/algorithms.py
+          ruff check src tests --select E9,F63,F7,F82
+
+      - name: Dependency Vulnerability Audit
+        run: |
+          pip-audit -r requirements.txt
+
   test-matrix:
     name: Test Python ${{ matrix.python-version }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
@@ -25,10 +54,10 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: ${{ matrix.python-version }}
           cache: 'pip'
@@ -44,12 +73,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Test Suite (Windows)
+      - name: Run Test Suite & GUI Smoke Check (Windows)
         if: runner.os == 'Windows'
         run: |
-          python tests/test_watermark.py
+          python -m unittest discover -s tests -p "test_*.py" -v
+          python -c "import sys; sys.path.insert(0, 'src'); import customtkinter as ctk; from ui.main_view import WatermarkApp; app = WatermarkApp(); app.update_idletasks(); app.destroy(); print('GUI Smoke PASS')"
 
-      - name: Run Test Suite (Linux with Xvfb Headless GUI)
+      - name: Run Test Suite & GUI Smoke Check (Linux with Xvfb)
         if: runner.os == 'Linux'
         run: |
-          xvfb-run -a python tests/test_watermark.py
+          xvfb-run -a python -m unittest discover -s tests -p "test_*.py" -v
+          xvfb-run -a python -c "import sys; sys.path.insert(0, 'src'); import customtkinter as ctk; from ui.main_view import WatermarkApp; app = WatermarkApp(); app.update_idletasks(); app.destroy(); print('GUI Smoke PASS')"

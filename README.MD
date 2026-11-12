@@ -21,7 +21,7 @@ Detect and sanitize imperceptible digital watermarks and steganographic payloads
   - `FFT`, `DCT`, `DWT (Frequency)`: Analyzes geometric patterns in Fourier and Wavelet spectrums.
 - **Adaptive Clearance Modes**: `Aggressive` (maximum removal), `Balanced` (recommended), `Conservative` (quality preservation).
 - **Privacy Engine**: 
-  - `Rand Name`: Hashes the output file with a random 9-character string.
+  - `Rand Name`: Renames the output file with a cryptographically random 12-character alphanumeric string.
   - `Rand Size`: Invokes an imperceptible micro-crop (±2px) to neutralize resolution-dependent fingerprinting.
   - `Force JPEG`: Compresses lossless images to strip container-level steganography.
 
@@ -86,9 +86,9 @@ This application employs a dual-domain analysis to detect and sanitize steganogr
 ```
 
 ## 🏗️ Tech Stack
-- **Backend Algorithms**: OpenCV (`cv2`), Numpy, PyWavelets, Scipy
+- **Backend Algorithms**: OpenCV (`cv2`), Numpy, PyWavelets
 - **Frontend Engine**: CustomTkinter (Tkinter Wrapper)
-- **Packaging**: PyInstaller + PIL (Dynamic Logo Generation)
+- **Packaging**: PyInstaller + Pillow
 
 ## ⚖️ Disclaimer & Educational Purpose
 
