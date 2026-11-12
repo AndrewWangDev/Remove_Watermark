@@ -1,7 +1,32 @@
+from dataclasses import dataclass
+import os
+import secrets
+import string
 import cv2
 import numpy as np
-import os
+from PIL import Image
 from .algorithms import process_lsb, process_fft, process_dct, process_dwt
+
+MAX_IMAGE_FILE_BYTES = 100 * 1024 * 1024  # 100 MB raw file cap
+MAX_IMAGE_PIXELS = 40_000_000             # 40 MP decompression cap
+SUPPORTED_OUTPUT_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
+
+
+@dataclass
+class ProcessResult:
+    """Structured result for WatermarkProcessor.process_image with tuple-unpack compatibility."""
+    success: bool
+    action: str
+    message: str = ""
+    output_path: str = ""
+    detections: dict = None
+    cancelled: bool = False
+
+    def __iter__(self):
+        payload = self.detections if (self.action == "detect" and self.success) else self.message
+        yield payload
+        yield self.success
+
 
 def blend_alpha_to_bgr(bgra_img: np.ndarray, bg_color=(255, 255, 255)) -> np.ndarray:
     """
@@ -10,23 +35,64 @@ def blend_alpha_to_bgr(bgra_img: np.ndarray, bg_color=(255, 255, 255)) -> np.nda
     """
     if len(bgra_img.shape) != 3 or bgra_img.shape[2] != 4:
         return bgra_img
+    orig_dtype = bgra_img.dtype
+    scale = 65535.0 if orig_dtype == np.uint16 else 255.0
     bgr = bgra_img[:, :, :3].astype(np.float32)
-    alpha = (bgra_img[:, :, 3].astype(np.float32) / 255.0)[:, :, np.newaxis]
-    bg = np.array(bg_color, dtype=np.float32)
+    alpha = (bgra_img[:, :, 3].astype(np.float32) / scale)[:, :, np.newaxis]
+    bg = np.array(bg_color, dtype=np.float32) * (257.0 if orig_dtype == np.uint16 else 1.0)
     blended = bgr * alpha + bg * (1.0 - alpha)
-    return np.clip(blended, 0, 255).astype(np.uint8)
+    if orig_dtype == np.uint16:
+        return np.clip(np.round(blended), 0, 65535).astype(np.uint16)
+    return np.clip(np.round(blended), 0, 255).astype(np.uint8)
 
-def imread_unicode(filepath: str, flags: int = cv2.IMREAD_UNCHANGED) -> np.ndarray:
-    """Read an image supporting Unicode, Chinese, and special character paths."""
+
+def load_image_checked(filepath: str, flags: int = cv2.IMREAD_UNCHANGED):
+    """
+    Validate file size and header dimensions (anti-decompression-bomb) before decoding.
+    Returns: (image_array | None, error_message)
+    """
     try:
-        if not os.path.exists(filepath):
-            return None
+        if not filepath or not os.path.isfile(filepath):
+            return None, "Error: File does not exist."
+
+        file_size = os.path.getsize(filepath)
+        if file_size > MAX_IMAGE_FILE_BYTES:
+            return None, f"Error: Image file exceeds {MAX_IMAGE_FILE_BYTES // (1024 * 1024)} MB safety limit."
+
+        prev_max = Image.MAX_IMAGE_PIXELS
+        Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+        try:
+            with Image.open(filepath) as pil_img:
+                w, h = pil_img.size
+                if w * h > MAX_IMAGE_PIXELS:
+                    return None, f"Error: Image resolution ({w}x{h}) exceeds {MAX_IMAGE_PIXELS:,} pixel safety limit."
+        except Image.DecompressionBombError:
+            return None, f"Error: Image exceeds maximum allowed pixel limit ({MAX_IMAGE_PIXELS:,} pixels)."
+        except Exception:
+            # Non-PIL formats fall through to post-imdecode shape validation
+            pass
+        finally:
+            Image.MAX_IMAGE_PIXELS = prev_max
+
         with open(filepath, 'rb') as f:
             data = np.frombuffer(f.read(), dtype=np.uint8)
         img = cv2.imdecode(data, flags)
-        return img
-    except Exception:
-        return None
+        if img is None:
+            return None, "Error: Could not load image (unsupported format or corrupted file)."
+
+        h, w = img.shape[:2]
+        if h * w > MAX_IMAGE_PIXELS:
+            return None, f"Error: Image resolution ({w}x{h}) exceeds {MAX_IMAGE_PIXELS:,} pixel safety limit."
+        return img, ""
+    except Exception as exc:
+        return None, f"Error: Failed to load image ({exc})."
+
+
+def imread_unicode(filepath: str, flags: int = cv2.IMREAD_UNCHANGED) -> np.ndarray:
+    """Read an image supporting Unicode, Chinese, and special character paths."""
+    img, _ = load_image_checked(filepath, flags=flags)
+    return img
+
 
 def imwrite_unicode(filepath: str, img: np.ndarray, quality: int = 95) -> bool:
     """Save an image supporting Unicode, Chinese, and special character paths."""
@@ -34,63 +100,127 @@ def imwrite_unicode(filepath: str, img: np.ndarray, quality: int = 95) -> bool:
         out_dir = os.path.dirname(os.path.abspath(filepath))
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
-            
+
         ext = os.path.splitext(filepath)[1].lower()
         if not ext:
             ext = ".png"
             filepath = filepath + ".png"
-            
+
         params = []
         if ext in [".jpg", ".jpeg"]:
             params = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
-            # JPEG format does not support 4-channel Alpha: blend over crisp white background
             if len(img.shape) == 3 and img.shape[2] == 4:
                 img = blend_alpha_to_bgr(img, (255, 255, 255))
-                
+            if img.dtype == np.uint16:
+                img = np.clip(np.round(img.astype(np.float32) / 257.0), 0, 255).astype(np.uint8)
+
         success, buf = cv2.imencode(ext, img, params)
         if not success:
             return False
-            
+
         with open(filepath, 'wb') as f:
             buf.tofile(f)
         return True
     except Exception:
         return False
 
+def _resolve_output_path(
+    image_path: str,
+    output_path: str,
+    force_jpeg: bool,
+    rand_name: bool
+) -> str:
+    """Resolve a collision-free output path without overwriting source or existing files."""
+    out_path_used = output_path.strip() if output_path else ""
+    if not out_path_used or out_path_used.startswith("Default"):
+        dir_name, file_name = os.path.split(image_path)
+        out_path_used = os.path.join(dir_name, "cleaned_" + file_name)
+    else:
+        _, ext = os.path.splitext(out_path_used)
+        is_dir_target = os.path.isdir(out_path_used) or (not ext) or out_path_used.endswith(("/", "\\"))
+        if is_dir_target:
+            os.makedirs(out_path_used, exist_ok=True)
+            file_name = os.path.basename(image_path)
+            out_path_used = os.path.join(out_path_used, "cleaned_" + file_name)
+        elif ext.lower() not in SUPPORTED_OUTPUT_EXTS:
+            raise ValueError(
+                f"Unsupported output extension '{ext}'. "
+                f"Supported: {', '.join(sorted(SUPPORTED_OUTPUT_EXTS))} (append '/' for a directory)."
+            )
+
+    if force_jpeg:
+        base, _ = os.path.splitext(out_path_used)
+        out_path_used = base + ".jpg"
+
+    src_abs = os.path.abspath(image_path)
+    if rand_name:
+        alphabet = string.ascii_lowercase + string.digits
+        base, ext = os.path.splitext(out_path_used)
+        out_dir = os.path.dirname(base)
+        for _ in range(32):
+            rand_str = ''.join(secrets.choice(alphabet) for _ in range(12))
+            candidate = os.path.join(out_dir, f"{rand_str}{ext}")
+            if not os.path.exists(candidate) and os.path.abspath(candidate) != src_abs:
+                out_path_used = candidate
+                break
+        else:
+            raise RuntimeError("Failed to generate a unique random output filename.")
+    else:
+        if os.path.exists(out_path_used) or os.path.abspath(out_path_used) == src_abs:
+            base, ext = os.path.splitext(out_path_used)
+            counter = 1
+            while os.path.exists(f"{base}_{counter}{ext}") or os.path.abspath(f"{base}_{counter}{ext}") == src_abs:
+                counter += 1
+            out_path_used = f"{base}_{counter}{ext}"
+
+    return out_path_used
+
+
 class WatermarkProcessor:
     def __init__(self):
         pass
 
     def process_image(
-        self, 
-        image_path: str, 
-        methods: list, 
-        action: str, 
-        color_preserve: bool, 
-        aggressiveness: str, 
-        output_path: str = "", 
-        cancel_check=None, 
-        rand_name=False, 
-        rand_size=False, 
+        self,
+        image_path: str,
+        methods: list,
+        action: str,
+        color_preserve: bool,
+        aggressiveness: str,
+        output_path: str = "",
+        cancel_check=None,
+        rand_name=False,
+        rand_size=False,
         force_jpeg=False,
         progress_callback=None
-    ):
+    ) -> ProcessResult:
         """
         Main entry point for processing an image.
-        Returns: (message: str, success: bool) for clean, (results: dict, detected: bool) for detect
+        Returns ProcessResult (iterable as (payload, success) for backward compatibility).
         """
         try:
             def _report(pct: int, msg: str = ""):
                 if progress_callback:
                     progress_callback(pct, msg)
 
-            if not os.path.exists(image_path):
-                return "Error: File does not exist.", False
-
             _report(5, "Loading image...")
-            raw_img = imread_unicode(image_path, cv2.IMREAD_UNCHANGED)
+            raw_img, load_err = load_image_checked(image_path, cv2.IMREAD_UNCHANGED)
             if raw_img is None:
-                return "Error: Could not load image (unsupported format or corrupted file).", False
+                return ProcessResult(success=False, action=action, message=load_err)
+
+            if raw_img.dtype not in (np.uint8, np.uint16):
+                return ProcessResult(
+                    success=False,
+                    action=action,
+                    message=f"Error: Unsupported pixel dtype '{raw_img.dtype}'. Only 8-bit and 16-bit images are supported."
+                )
+
+            if len(raw_img.shape) not in (2, 3) or (len(raw_img.shape) == 3 and raw_img.shape[2] not in (3, 4)):
+                return ProcessResult(
+                    success=False,
+                    action=action,
+                    message=f"Error: Unsupported image channel layout {raw_img.shape}."
+                )
 
             # Extract Alpha channel if present
             alpha_channel = None
@@ -108,7 +238,7 @@ class WatermarkProcessor:
                 channel_to_process = y_channel
             else:
                 channel_to_process = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2GRAY)
-                
+
             results = {}
             current_channel = channel_to_process.copy()
             _report(15, "Initializing processing pipeline...")
@@ -126,7 +256,7 @@ class WatermarkProcessor:
                 total_methods = len(methods)
                 for idx, m_name in enumerate(methods):
                     if cancel_check and cancel_check():
-                        return "Task cancelled by user.", False
+                        return ProcessResult(success=False, action=action, message="Task cancelled by user.", cancelled=True)
 
                     step_pct = 20 + int((idx / max(1, total_methods)) * 75)
                     _report(step_pct, f"Running {m_name} detection...")
@@ -136,8 +266,6 @@ class WatermarkProcessor:
                         continue
 
                     if m_name == "LSB":
-                        # LSB analyzes native image color channels (B, G, R, and Alpha)
-                        # to catch single-channel steganographic payloads (e.g. Blue channel only)
                         channels_to_test = []
                         if len(bgr_img.shape) == 3 and bgr_img.shape[2] == 3:
                             channels_to_test.extend([bgr_img[:, :, 0], bgr_img[:, :, 1], bgr_img[:, :, 2]])
@@ -151,29 +279,32 @@ class WatermarkProcessor:
                         max_score = 0.0
                         for ch_data in channels_to_test:
                             if cancel_check and cancel_check():
-                                return "Task cancelled by user.", False
+                                return ProcessResult(success=False, action=action, message="Task cancelled by user.", cancelled=True)
                             ch_res = fn(ch_data, aggressiveness, "detect", cancel_check=cancel_check)
-                            if ch_res and ch_res.get("detected"):
+                            if ch_res is None:
+                                return ProcessResult(success=False, action=action, message="Task cancelled by user.", cancelled=True)
+                            if ch_res.get("detected"):
                                 best_detected = True
-                            if ch_res:
-                                max_score = max(max_score, ch_res.get("score", 0.0))
+                            max_score = max(max_score, ch_res.get("score", 0.0))
 
                         det_res = {"detected": bool(best_detected), "score": float(round(max_score, 4))}
                     else:
                         det_res = fn(current_channel, aggressiveness, "detect", cancel_check=cancel_check)
+                        if det_res is None:
+                            return ProcessResult(success=False, action=action, message="Task cancelled by user.", cancelled=True)
+
                     results[m_name] = det_res
 
                 _report(100, "Detection complete")
                 if not results:
-                    return None, False
-                return results, True
+                    return ProcessResult(success=False, action=action, message="Error: Please select at least one valid detection method.")
+                return ProcessResult(success=True, action=action, detections=results)
 
             # ----------------------------------------------------
-            # CLEANING FLOW (Corrected Pipeline Ordering)
-            # Order: Frequency Filtering (FFT/DCT/DWT) -> Color Reconstruction -> Final LSB Sweep
+            # CLEANING FLOW (Frequency Filtering -> Color Reconstruction -> Final LSB Sweep)
             # ----------------------------------------------------
             if not methods:
-                return "Error: No clean method selected", False
+                return ProcessResult(success=False, action=action, message="Error: No clean method selected.")
 
             freq_methods = [m for m in ["FFT", "DCT", "DWT"] if m in methods]
             freq_algo_map = {
@@ -182,22 +313,20 @@ class WatermarkProcessor:
                 "DWT": process_dwt
             }
 
-            # Phase 1: Frequency domain processing on luminance and chrominance
             for idx, m_name in enumerate(freq_methods):
                 if cancel_check and cancel_check():
-                    return "Task cancelled by user.", False
+                    return ProcessResult(success=False, action=action, message="Task cancelled by user.", cancelled=True)
                 step_pct = 20 + int((idx / max(1, len(freq_methods) + 1)) * 50)
                 _report(step_pct, f"Filtering {m_name} artifacts...")
 
                 fn = freq_algo_map[m_name]
                 current_channel = fn(current_channel, aggressiveness, "clean", cancel_check=cancel_check)
                 if current_channel is None:
-                    return "Task cancelled by user.", False
+                    return ProcessResult(success=False, action=action, message="Task cancelled by user.", cancelled=True)
 
             if cancel_check and cancel_check():
-                return "Task cancelled by user.", False
+                return ProcessResult(success=False, action=action, message="Task cancelled by user.", cancelled=True)
 
-            # Phase 2: Color Space & Channel Reconstruction
             _report(75, "Reconstructing color spaces...")
             if color_preserve:
                 if aggressiveness == "Aggressive":
@@ -212,10 +341,8 @@ class WatermarkProcessor:
             else:
                 result_img = current_channel
 
-            # Handle Alpha / Transparency
             if alpha_channel is not None:
                 if force_jpeg:
-                    # Blend transparent PNG over solid white background before export
                     if len(result_img.shape) == 2:
                         result_img = cv2.cvtColor(result_img, cv2.COLOR_GRAY2BGR)
                     bgra_combined = cv2.merge([result_img[:, :, 0], result_img[:, :, 1], result_img[:, :, 2], alpha_channel])
@@ -225,61 +352,36 @@ class WatermarkProcessor:
                         result_img = cv2.cvtColor(result_img, cv2.COLOR_GRAY2BGR)
                     result_img = cv2.merge([result_img[:, :, 0], result_img[:, :, 1], result_img[:, :, 2], alpha_channel])
 
-            # Phase 3: Final All-Channel Spatial LSB Sweep (Ensures zero-noise bit-planes)
             if "LSB" in methods:
                 if cancel_check and cancel_check():
-                    return "Task cancelled by user.", False
+                    return ProcessResult(success=False, action=action, message="Task cancelled by user.", cancelled=True)
                 _report(85, "Neutralizing spatial LSB planes...")
                 if len(result_img.shape) == 3:
                     channels = list(cv2.split(result_img))
                     for c_idx in range(len(channels)):
-                        channels[c_idx] = process_lsb(channels[c_idx], aggressiveness, "clean")
+                        cleaned_ch = process_lsb(channels[c_idx], aggressiveness, "clean", cancel_check=cancel_check)
+                        if cleaned_ch is None:
+                            return ProcessResult(success=False, action=action, message="Task cancelled by user.", cancelled=True)
+                        channels[c_idx] = cleaned_ch
                     result_img = cv2.merge(channels)
                 else:
-                    result_img = process_lsb(result_img, aggressiveness, "clean")
+                    result_img = process_lsb(result_img, aggressiveness, "clean", cancel_check=cancel_check)
+                    if result_img is None:
+                        return ProcessResult(success=False, action=action, message="Task cancelled by user.", cancelled=True)
 
             if cancel_check and cancel_check():
-                return "Task cancelled by user.", False
+                return ProcessResult(success=False, action=action, message="Task cancelled by user.", cancelled=True)
 
-            # Phase 4: Privacy Randomization & Output Generation
             if rand_size:
-                import random
                 h, w = result_img.shape[:2]
-                crop_t = random.randint(0, 2)
-                crop_b = random.randint(0, 2)
-                crop_l = random.randint(0, 2)
-                crop_r = random.randint(0, 2)
+                crop_t = secrets.randbelow(3)
+                crop_b = secrets.randbelow(3)
+                crop_l = secrets.randbelow(3)
+                crop_r = secrets.randbelow(3)
                 if h - crop_t - crop_b > 10 and w - crop_l - crop_r > 10:
-                    result_img = result_img[crop_t:h-crop_b, crop_l:w-crop_r]
+                    result_img = result_img[crop_t:h - crop_b, crop_l:w - crop_r]
 
-            out_path_used = output_path.strip() if output_path else ""
-            if not out_path_used or out_path_used.startswith("Default"):
-                dir_name, file_name = os.path.split(image_path)
-                out_path_used = os.path.join(dir_name, "cleaned_" + file_name)
-            else:
-                _, ext = os.path.splitext(out_path_used)
-                is_dir_target = os.path.isdir(out_path_used) or (not ext) or out_path_used.endswith(("/", "\\"))
-                if is_dir_target:
-                    os.makedirs(out_path_used, exist_ok=True)
-                    file_name = os.path.basename(image_path)
-                    out_path_used = os.path.join(out_path_used, "cleaned_" + file_name)
-
-            if force_jpeg:
-                base, _ = os.path.splitext(out_path_used)
-                out_path_used = base + ".jpg"
-
-            if rand_name:
-                import random, string
-                rand_str = ''.join(random.choices(string.ascii_letters + string.digits, k=9))
-                base, ext = os.path.splitext(out_path_used)
-                out_path_used = os.path.join(os.path.dirname(base), f"{rand_str}{ext}")
-            else:
-                if os.path.exists(out_path_used):
-                    base, ext = os.path.splitext(out_path_used)
-                    counter = 1
-                    while os.path.exists(f"{base}_{counter}{ext}"):
-                        counter += 1
-                    out_path_used = f"{base}_{counter}{ext}"
+            out_path_used = _resolve_output_path(image_path, output_path, force_jpeg, rand_name)
 
             _report(94, "Writing output image...")
             save_ok = imwrite_unicode(out_path_used, result_img)
@@ -287,8 +389,17 @@ class WatermarkProcessor:
                 raise RuntimeError(f"Failed to write image to [{out_path_used}]. Check directory write permissions.")
 
             _report(100, "Clean complete")
-            return f"Image cleaned and saved to:\n{out_path_used}", True
+            return ProcessResult(
+                success=True,
+                action=action,
+                message=f"Image cleaned and saved to:\n{out_path_used}",
+                output_path=out_path_used
+            )
 
         except Exception as e:
             import traceback
-            return f"Error during processing: {str(e)}\n{traceback.format_exc()}", False
+            return ProcessResult(
+                success=False,
+                action=action,
+                message=f"Error during processing: {str(e)}\n{traceback.format_exc()}"
+            )
