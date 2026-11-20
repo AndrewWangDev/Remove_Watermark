@@ -277,17 +277,17 @@ def process_dct(img_channel, mode, action="clean", cancel_check=None):
         cv = std_ac / (mean_ac + 1e-5)
 
         threshold_ac = 2200.0 if mode == "Conservative" else (1600.0 if mode == "Balanced" else 1200.0)
+        p25_thresh = 200.0 if mode == "Conservative" else (35.0 if mode == "Balanced" else 20.0)
+        mid_ratio_thresh = 0.55 if mode == "Conservative" else (0.45 if mode == "Balanced" else 0.40)
 
         is_watermark = False
-        if p25_ac > 20.0 and global_mid_ratio > 0.40:
+        if p25_ac > p25_thresh and global_mid_ratio > mid_ratio_thresh:
             is_watermark = True
         elif p90_ac > threshold_ac and global_mid_ratio > 0.45 and cv < 1.3:
             is_watermark = True
 
-        score_val = p25_ac * 10.0 + p90_ac * global_mid_ratio * 0.05
-        if is_watermark and score_val < 450.0:
-            score_val = max(score_val, 450.0 * (p90_ac / max(threshold_ac, 1.0)))
-        return {"detected": bool(is_watermark), "score": float(round(score_val, 2))}
+        score_val = float(round(p25_ac * 10.0 + p90_ac * global_mid_ratio * 0.05, 2))
+        return {"detected": bool(is_watermark), "score": score_val}
 
     if action == "clean":
         if cancel_check and cancel_check():
@@ -311,7 +311,12 @@ def process_dct(img_channel, mode, action="clean", cancel_check=None):
         elif mode == "Conservative":
             q_factor = 0.2
 
-        quant_matrix = np.maximum(Q_base * q_factor, 1.0)
+        if orig_dtype == np.uint16:
+            # Scale quantization step appropriately for 16-bit high-dynamic range
+            # so that 16-bit fine gradations are not crushed by coarse 8-bit scale quantization
+            q_factor = q_factor * (16.0 / 257.0)
+
+        quant_matrix = np.maximum(Q_base * q_factor, 0.05 if orig_dtype == np.uint16 else 1.0)
 
         # Vectorized quantization across all blocks
         blocks_q = np.round(blocks_dct / quant_matrix) * quant_matrix

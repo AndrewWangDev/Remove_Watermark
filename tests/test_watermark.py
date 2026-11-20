@@ -247,6 +247,61 @@ class TestWatermarkSuite(unittest.TestCase):
                 self.assertIsNone(loaded)
                 self.assertIn("pixel", err.lower())
 
+    def test_exif_orientation_transposition(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as tmpdir:
+            img_path = os.path.join(tmpdir, "portrait_exif.jpg")
+            img = Image.new("RGB", (100, 200), color="blue")
+            exif = img.getexif()
+            exif[0x0112] = 6  # 90 degrees CW rotation
+            img.save(img_path, exif=exif)
+
+            loaded = imread_unicode(img_path)
+            self.assertIsNotNone(loaded)
+            # 100x200 with orientation 6 should be transposed to 200x100
+            self.assertEqual(loaded.shape[0], 100)  # height
+            self.assertEqual(loaded.shape[1], 200)  # width
+
+    def test_rand_size_guaranteed_crop(self):
+        img = _make_dummy_image(80, 80, 3)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            in_path = os.path.join(tmpdir, "rand_size_in.png")
+            out_path = os.path.join(tmpdir, "rand_size_out.png")
+            self.assertTrue(imwrite_unicode(in_path, img))
+
+            # Test 20 times to confirm that 0-crop is strictly never generated
+            for _ in range(20):
+                res = WatermarkProcessor().process_image(
+                    image_path=in_path,
+                    methods=["LSB"],
+                    action="clean",
+                    color_preserve=True,
+                    aggressiveness="Balanced",
+                    output_path=out_path,
+                    rand_size=True
+                )
+                self.assertTrue(res.success)
+                out_img = imread_unicode(out_path)
+                self.assertTrue(out_img.shape[0] < 80 or out_img.shape[1] < 80, "Rand Size failed to crop!")
+                self.assertGreaterEqual(out_img.shape[0], 76)
+                self.assertGreaterEqual(out_img.shape[1], 76)
+
+    def test_dct_gradient_noise_conservative_mode(self):
+        rng = np.random.default_rng(42)
+        y, x = np.mgrid[0:128, 0:128]
+        grad = (x * (200.0 / 128.0)).astype(np.float32)
+        noise = rng.normal(0, 3.0, (128, 128)).astype(np.float32)
+        img = np.clip(grad + noise, 0, 255).astype(np.uint8)
+
+        det = process_dct(img, "Conservative", "detect")
+        self.assertFalse(det["detected"], "Conservative mode falsely detected smooth gradient noise as watermark!")
+
+    def test_uint16_gradient_banding_protection(self):
+        ramp = np.linspace(20000, 40000, 64 * 64, dtype=np.float32).reshape((64, 64)).astype(np.uint16)
+        cleaned = process_dct(ramp, "Balanced", "clean")
+        unique_count = len(np.unique(cleaned))
+        self.assertGreater(unique_count, 3000, f"16-bit dynamic range was crushed: {unique_count} unique values")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -4,7 +4,7 @@ import secrets
 import string
 import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 from .algorithms import process_lsb, process_fft, process_dct, process_dwt
 
 MAX_IMAGE_FILE_BYTES = 100 * 1024 * 1024  # 100 MB raw file cap
@@ -61,11 +61,30 @@ def load_image_checked(filepath: str, flags: int = cv2.IMREAD_UNCHANGED):
 
         prev_max = Image.MAX_IMAGE_PIXELS
         Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+        pil_transposed_arr = None
         try:
             with Image.open(filepath) as pil_img:
                 w, h = pil_img.size
                 if w * h > MAX_IMAGE_PIXELS:
                     return None, f"Error: Image resolution ({w}x{h}) exceeds {MAX_IMAGE_PIXELS:,} pixel safety limit."
+
+                # If EXIF orientation is present and requires rotation/flip, normalize physical orientation
+                exif = pil_img.getexif() if hasattr(pil_img, "getexif") else None
+                orientation = exif.get(0x0112) if exif else None
+                if orientation in (2, 3, 4, 5, 6, 7, 8):
+                    t_img = ImageOps.exif_transpose(pil_img)
+                    if t_img is not None:
+                        mode = t_img.mode
+                        if mode == "RGB":
+                            pil_transposed_arr = cv2.cvtColor(np.array(t_img), cv2.COLOR_RGB2BGR)
+                        elif mode == "RGBA":
+                            pil_transposed_arr = cv2.cvtColor(np.array(t_img), cv2.COLOR_RGBA2BGRA)
+                        elif mode == "L":
+                            pil_transposed_arr = np.array(t_img)
+                        elif mode in ("I;16", "I"):
+                            pil_transposed_arr = np.array(t_img, dtype=np.uint16)
+                        else:
+                            pil_transposed_arr = cv2.cvtColor(np.array(t_img.convert("RGB")), cv2.COLOR_RGB2BGR)
         except Image.DecompressionBombError:
             return None, f"Error: Image exceeds maximum allowed pixel limit ({MAX_IMAGE_PIXELS:,} pixels)."
         except Exception:
@@ -73,6 +92,9 @@ def load_image_checked(filepath: str, flags: int = cv2.IMREAD_UNCHANGED):
             pass
         finally:
             Image.MAX_IMAGE_PIXELS = prev_max
+
+        if pil_transposed_arr is not None:
+            return pil_transposed_arr, ""
 
         with open(filepath, 'rb') as f:
             data = np.frombuffer(f.read(), dtype=np.uint8)
@@ -95,7 +117,8 @@ def imread_unicode(filepath: str, flags: int = cv2.IMREAD_UNCHANGED) -> np.ndarr
 
 
 def imwrite_unicode(filepath: str, img: np.ndarray, quality: int = 95) -> bool:
-    """Save an image supporting Unicode, Chinese, and special character paths."""
+    """Save an image supporting Unicode, Chinese, and special character paths with atomic replacement."""
+    tmp_path = None
     try:
         out_dir = os.path.dirname(os.path.abspath(filepath))
         if out_dir:
@@ -118,10 +141,21 @@ def imwrite_unicode(filepath: str, img: np.ndarray, quality: int = 95) -> bool:
         if not success:
             return False
 
-        with open(filepath, 'wb') as f:
+        # Atomic write: write to a temporary file in the same directory, then atomic rename
+        tmp_token = secrets.token_hex(4)
+        tmp_path = os.path.join(out_dir, f".tmp_{tmp_token}_{os.path.basename(filepath)}")
+        with open(tmp_path, 'wb') as f:
             buf.tofile(f)
+
+        os.replace(tmp_path, filepath)
+        tmp_path = None
         return True
     except Exception:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
         return False
 
 def _resolve_output_path(
@@ -374,10 +408,12 @@ class WatermarkProcessor:
 
             if rand_size:
                 h, w = result_img.shape[:2]
-                crop_t = secrets.randbelow(3)
-                crop_b = secrets.randbelow(3)
-                crop_l = secrets.randbelow(3)
-                crop_r = secrets.randbelow(3)
+                crop_t, crop_b, crop_l, crop_r = 0, 0, 0, 0
+                while (crop_t + crop_b + crop_l + crop_r) == 0:
+                    crop_t = secrets.randbelow(3)
+                    crop_b = secrets.randbelow(3)
+                    crop_l = secrets.randbelow(3)
+                    crop_r = secrets.randbelow(3)
                 if h - crop_t - crop_b > 10 and w - crop_l - crop_r > 10:
                     result_img = result_img[crop_t:h - crop_b, crop_l:w - crop_r]
 

@@ -73,6 +73,7 @@ class WatermarkApp(ctk.CTk):
         self._is_closing = False
         self._about_window = None
         self._showing_mode_warning = False
+        self._worker_thread = None
         self.last_cleaned_path = None
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -100,6 +101,11 @@ class WatermarkApp(ctk.CTk):
     def _on_close(self):
         self._is_closing = True
         self.cancel_event.set()
+        if hasattr(self, "_worker_thread") and self._worker_thread and self._worker_thread.is_alive():
+            try:
+                self._worker_thread.join(timeout=1.5)
+            except Exception:
+                pass
         if self._about_window is not None:
             try:
                 if self._about_window.winfo_exists():
@@ -624,6 +630,7 @@ class WatermarkApp(ctk.CTk):
     def _execute_action_threaded(self, params: dict):
         t = threading.Thread(target=self._execute_action, args=(params,))
         t.daemon = True
+        self._worker_thread = t
         t.start()
 
     def _execute_action(self, params: dict):
@@ -730,7 +737,7 @@ class WatermarkApp(ctk.CTk):
             self.log_box.insert("end", "| ")
         self.log_box.insert("end", "\n")
 
-        # Deterministic weighted probability calculation
+        # Deterministic weighted heuristic risk index calculation
         total_weight = 0
         earned_weight = 0
         weights = {"LSB": 25, "FFT": 40, "DCT": 15, "DWT": 20}
@@ -744,21 +751,21 @@ class WatermarkApp(ctk.CTk):
                 earned_weight += w * 0.5
                 
         if total_weight > 0 and (found_methods or suspicious_methods):
-            prob = int((earned_weight / total_weight) * 95)
-            prob = min(prob, 99)
+            risk_index = int((earned_weight / total_weight) * 95)
+            risk_index = min(risk_index, 99)
         else:
-            prob = 0
+            risk_index = 0
         
-        if prob >= 70:
+        if risk_index >= 70:
             kw = "The image is probably watermarked"
             color = "error"
-        elif prob >= 50:
+        elif risk_index >= 50:
             kw = "The image is likely watermarked"
             color = "warning"
-        elif prob >= 25:
+        elif risk_index >= 25:
             kw = "The image is possibly watermarked"
             color = "warning"
-        elif prob > 0:
+        elif risk_index > 0:
             kw = "The image is conceivably watermarked"
             color = "info"
         else:
@@ -766,7 +773,10 @@ class WatermarkApp(ctk.CTk):
             color = "success"
 
         self.log_box.insert("end", "Conclusion: ")
-        self.log_box.insert("end", f"{kw} ({prob}% probability).\n", color)
+        if risk_index > 0:
+            self.log_box.insert("end", f"{kw} (Heuristic Risk Index: {risk_index}%).\n", color)
+        else:
+            self.log_box.insert("end", f"{kw} (No significant anomalies detected).\n", color)
         
         if found_methods or suspicious_methods:
             details = []
