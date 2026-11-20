@@ -35,8 +35,8 @@ def get_detection_level(method: str, score: float, detected: bool):
         if detected or score >= 120.0: return "warning", "Suspicious"
         return "success", "Clean"
     elif method == "DCT":
-        if (detected and score >= 450.0) or score >= 800.0: return "error", "Found"
-        if score >= 200.0 or detected: return "warning", "Suspicious"
+        if detected and score >= 450.0: return "error", "Found"
+        if detected or score >= 200.0: return "warning", "Suspicious"
         return "success", "Clean"
     elif method == "DWT":
         if score >= 250.0: return "error", "Found"

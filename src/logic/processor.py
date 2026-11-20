@@ -182,8 +182,10 @@ def _resolve_output_path(
                 f"Supported: {', '.join(sorted(SUPPORTED_OUTPUT_EXTS))} (append '/' for a directory)."
             )
 
-    if force_jpeg:
-        base, _ = os.path.splitext(out_path_used)
+    base, cur_ext = os.path.splitext(out_path_used)
+    if not cur_ext:
+        out_path_used = base + (".jpg" if force_jpeg else ".png")
+    elif force_jpeg:
         out_path_used = base + ".jpg"
 
     src_abs = os.path.abspath(image_path)

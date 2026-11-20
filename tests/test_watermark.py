@@ -302,6 +302,80 @@ class TestWatermarkSuite(unittest.TestCase):
         unique_count = len(np.unique(cleaned))
         self.assertGreater(unique_count, 3000, f"16-bit dynamic range was crushed: {unique_count} unique values")
 
+    def test_new_01_ui_dct_conservative_grading(self):
+        rng = np.random.default_rng(42)
+        y, x = np.mgrid[0:128, 0:128]
+        grad = (x * (200.0 / 128.0)).astype(np.float32)
+
+        # 1. Smooth gradient with subtle natural noise should be completely Clean
+        noise_subtle = rng.normal(0, 0.5, (128, 128)).astype(np.float32)
+        img_clean = np.clip(grad + noise_subtle, 0, 255).astype(np.uint8)
+
+        # 2. Gradient with moderate noise where score exceeds 200 but detected is False
+        noise_mod = rng.normal(0, 3.0, (128, 128)).astype(np.float32)
+        img_noise = np.clip(grad + noise_mod, 0, 255).astype(np.uint8)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p_clean = os.path.join(tmpdir, "grad_clean.png")
+            self.assertTrue(imwrite_unicode(p_clean, img_clean))
+            res_c, ok_c = WatermarkProcessor().process_image(
+                image_path=p_clean,
+                methods=["DCT"],
+                action="detect",
+                color_preserve=True,
+                aggressiveness="Conservative"
+            )
+            self.assertTrue(ok_c)
+            self.assertFalse(res_c["DCT"]["detected"])
+            lvl_c, lbl_c = get_detection_level("DCT", res_c["DCT"]["score"], res_c["DCT"]["detected"])
+            self.assertEqual(lvl_c, "success")
+            self.assertEqual(lbl_c, "Clean")
+
+            p_noise = os.path.join(tmpdir, "grad_noise.png")
+            self.assertTrue(imwrite_unicode(p_noise, img_noise))
+            res_n, ok_n = WatermarkProcessor().process_image(
+                image_path=p_noise,
+                methods=["DCT"],
+                action="detect",
+                color_preserve=True,
+                aggressiveness="Conservative"
+            )
+            self.assertTrue(ok_n)
+            self.assertFalse(res_n["DCT"]["detected"])
+            lvl_n, lbl_n = get_detection_level("DCT", res_n["DCT"]["score"], res_n["DCT"]["detected"])
+            # Crucial assertion for NEW-01: UI level must NEVER be "Found" (error) when detected is False
+            self.assertNotEqual(lvl_n, "error")
+            self.assertNotEqual(lbl_n, "Found")
+
+    def test_new_02_extensionless_path_contract_consistency(self):
+        img = _make_dummy_image(64, 64, 3)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw_in = os.path.join(tmpdir, "raw_no_ext_input")
+            self.assertTrue(imwrite_unicode(raw_in + ".png", img))
+            os.rename(raw_in + ".png", raw_in)
+
+            out_dir = os.path.join(tmpdir, "out_sub")
+            res = WatermarkProcessor().process_image(
+                image_path=raw_in,
+                methods=["LSB"],
+                action="clean",
+                color_preserve=True,
+                aggressiveness="Balanced",
+                output_path=out_dir
+            )
+            self.assertTrue(res.success)
+            self.assertTrue(os.path.exists(res.output_path), f"Output file does not exist: {res.output_path}")
+            self.assertTrue(res.output_path.endswith(".png"))
+            loaded = imread_unicode(res.output_path)
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded.shape, (64, 64, 3))
+
+    def test_algo_01_fft_conservative_periodic_texture_resilience(self):
+        y, x = np.mgrid[0:256, 0:256]
+        img = (128 + 127 * np.sin((x + y) * 2 * np.pi / 16)).astype(np.uint8)
+        res = process_fft(img, "Conservative", "detect")
+        self.assertFalse(res["detected"], f"Conservative FFT falsely triggered on sinusoidal texture: {res}")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

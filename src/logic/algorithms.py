@@ -180,14 +180,16 @@ def process_fft(img_channel, mode, action="clean", cancel_check=None):
 
     threshold_factor = 5.0
     if mode == "Conservative":
-        threshold_factor = 7.0
+        threshold_factor = 9.0
     elif mode == "Aggressive":
         threshold_factor = 3.5
 
     threshold = mean_val + threshold_factor * std_val
 
     spikes = valid_mask & (magnitude_spectrum > threshold)
-    detected = bool(np.any(spikes))
+    spike_count = int(np.sum(spikes))
+    min_spikes = 4 if mode == "Conservative" else (2 if mode == "Balanced" else 1)
+    detected = bool(spike_count >= min_spikes)
 
     if action == "detect":
         max_val = float(np.max(valid_vals))
@@ -286,7 +288,8 @@ def process_dct(img_channel, mode, action="clean", cancel_check=None):
         elif p90_ac > threshold_ac and global_mid_ratio > 0.45 and cv < 1.3:
             is_watermark = True
 
-        score_val = float(round(p25_ac * 10.0 + p90_ac * global_mid_ratio * 0.05, 2))
+        score_scale = 35.0 / p25_thresh
+        score_val = float(round(p25_ac * score_scale * 10.0 + p90_ac * global_mid_ratio * 0.05, 2))
         return {"detected": bool(is_watermark), "score": score_val}
 
     if action == "clean":
