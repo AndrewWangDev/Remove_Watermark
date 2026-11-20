@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 import numpy as np
 import cv2
+from PIL import Image, ImageCms
 
 # Ensure repo root is on sys.path
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -375,6 +376,79 @@ class TestWatermarkSuite(unittest.TestCase):
         img = (128 + 127 * np.sin((x + y) * 2 * np.pi / 16)).astype(np.uint8)
         res = process_fft(img, "Conservative", "detect")
         self.assertFalse(res["detected"], f"Conservative FFT falsely triggered on sinusoidal texture: {res}")
+
+    def test_algo_01_fft_balanced_periodic_texture_resilience(self):
+        y, x = np.mgrid[0:256, 0:256]
+        img = (128 + 127 * np.sin((x + y) * 2 * np.pi / 16)).astype(np.uint8)
+        res = process_fft(img, "Balanced", "detect")
+        self.assertFalse(res["detected"], f"Balanced FFT falsely triggered on sinusoidal texture: {res}")
+        lvl, lbl = get_detection_level("FFT", res["score"], res["detected"])
+        self.assertEqual(lbl, "Clean")
+        self.assertEqual(lvl, "success")
+
+    def test_algo_03_clean_document_zero_fidelity_loss(self):
+        doc = np.full((128, 128, 3), 255, dtype=np.uint8)
+        cv2.putText(doc, "INV #102", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+        cv2.line(doc, (10, 70), (110, 70), (0, 0, 0), 2)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            in_p = os.path.join(tmpdir, "doc.png")
+            out_p = os.path.join(tmpdir, "doc_cleaned.png")
+            self.assertTrue(imwrite_unicode(in_p, doc))
+
+            res = WatermarkProcessor().process_image(
+                image_path=in_p,
+                methods=["FFT", "DCT", "DWT", "LSB"],
+                action="clean",
+                color_preserve=True,
+                aggressiveness="Balanced",
+                output_path=out_p
+            )
+            self.assertTrue(res.success)
+            cleaned = imread_unicode(out_p)
+            diff = np.abs(doc.astype(np.float32) - cleaned.astype(np.float32))
+            self.assertEqual(float(np.max(diff)), 0.0, "Clean document was degraded by cleaning pipeline!")
+
+    def test_func_02_icc_profile_and_multiframe_gif(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 1. ICC Profile preservation
+            srgb = ImageCms.createProfile("sRGB")
+            icc_data = ImageCms.ImageCmsProfile(srgb).tobytes()
+            p_icc_in = os.path.join(tmpdir, "icc_in.png")
+            p_icc_out = os.path.join(tmpdir, "icc_out.png")
+            Image.new("RGB", (32, 32), (100, 150, 200)).save(p_icc_in, icc_profile=icc_data)
+
+            res_icc = WatermarkProcessor().process_image(
+                image_path=p_icc_in,
+                methods=["LSB"],
+                action="clean",
+                color_preserve=True,
+                aggressiveness="Balanced",
+                output_path=p_icc_out
+            )
+            self.assertTrue(res_icc.success)
+            with Image.open(p_icc_out) as check_icc:
+                self.assertIn("icc_profile", check_icc.info)
+
+            # 2. Multi-frame GIF preservation
+            g_in = os.path.join(tmpdir, "multi.gif")
+            g_out = os.path.join(tmpdir, "multi_cleaned.gif")
+            f1 = Image.new("RGB", (32, 32), (255, 0, 0))
+            f2 = Image.new("RGB", (32, 32), (0, 255, 0))
+            f1.save(g_in, save_all=True, append_images=[f2], duration=120, loop=0)
+
+            res_g = WatermarkProcessor().process_image(
+                image_path=g_in,
+                methods=["LSB"],
+                action="clean",
+                color_preserve=True,
+                aggressiveness="Balanced",
+                output_path=g_out
+            )
+            self.assertTrue(res_g.success)
+            with Image.open(g_out) as check_g:
+                self.assertEqual(getattr(check_g, "n_frames", 1), 2)
+                self.assertEqual(check_g.info.get("duration"), 120)
 
 
 if __name__ == "__main__":

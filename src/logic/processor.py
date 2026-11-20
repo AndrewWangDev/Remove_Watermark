@@ -4,12 +4,12 @@ import secrets
 import string
 import cv2
 import numpy as np
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageSequence
 from .algorithms import process_lsb, process_fft, process_dct, process_dwt
 
 MAX_IMAGE_FILE_BYTES = 100 * 1024 * 1024  # 100 MB raw file cap
 MAX_IMAGE_PIXELS = 40_000_000             # 40 MP decompression cap
-SUPPORTED_OUTPUT_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
+SUPPORTED_OUTPUT_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff", ".gif"}
 
 
 @dataclass
@@ -116,7 +116,7 @@ def imread_unicode(filepath: str, flags: int = cv2.IMREAD_UNCHANGED) -> np.ndarr
     return img
 
 
-def imwrite_unicode(filepath: str, img: np.ndarray, quality: int = 95) -> bool:
+def imwrite_unicode(filepath: str, img: np.ndarray, quality: int = 95, icc_profile: bytes = None) -> bool:
     """Save an image supporting Unicode, Chinese, and special character paths with atomic replacement."""
     tmp_path = None
     try:
@@ -129,23 +129,44 @@ def imwrite_unicode(filepath: str, img: np.ndarray, quality: int = 95) -> bool:
             ext = ".png"
             filepath = filepath + ".png"
 
-        params = []
-        if ext in [".jpg", ".jpeg"]:
-            params = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
-            if len(img.shape) == 3 and img.shape[2] == 4:
-                img = blend_alpha_to_bgr(img, (255, 255, 255))
-            if img.dtype == np.uint16:
-                img = np.clip(np.round(img.astype(np.float32) / 257.0), 0, 255).astype(np.uint8)
-
-        success, buf = cv2.imencode(ext, img, params)
-        if not success:
-            return False
-
         # Atomic write: write to a temporary file in the same directory, then atomic rename
         tmp_token = secrets.token_hex(4)
         tmp_path = os.path.join(out_dir, f".tmp_{tmp_token}_{os.path.basename(filepath)}")
-        with open(tmp_path, 'wb') as f:
-            buf.tofile(f)
+
+        if icc_profile:
+            # Use Pillow to save with preserved ICC profile (wide color gamut: Display P3, AdobeRGB, etc.)
+            if len(img.shape) == 2:
+                pil_save = Image.fromarray(img)
+            elif img.shape[2] == 3:
+                pil_save = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            elif img.shape[2] == 4:
+                if ext in [".jpg", ".jpeg"]:
+                    img_bgr = blend_alpha_to_bgr(img, (255, 255, 255))
+                    pil_save = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+                else:
+                    pil_save = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA))
+            else:
+                pil_save = Image.fromarray(img)
+
+            save_kwargs = {"icc_profile": icc_profile}
+            if ext in [".jpg", ".jpeg"]:
+                save_kwargs["quality"] = quality
+            pil_save.save(tmp_path, **save_kwargs)
+        else:
+            params = []
+            if ext in [".jpg", ".jpeg"]:
+                params = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
+                if len(img.shape) == 3 and img.shape[2] == 4:
+                    img = blend_alpha_to_bgr(img, (255, 255, 255))
+                if img.dtype == np.uint16:
+                    img = np.clip(np.round(img.astype(np.float32) / 257.0), 0, 255).astype(np.uint8)
+
+            success, buf = cv2.imencode(ext, img, params)
+            if not success:
+                return False
+
+            with open(tmp_path, 'wb') as f:
+                buf.tofile(f)
 
         os.replace(tmp_path, filepath)
         tmp_path = None
@@ -240,6 +261,67 @@ class WatermarkProcessor:
                     progress_callback(pct, msg)
 
             _report(5, "Loading image...")
+            # Check for ICC profile and multi-frame animation (GIF / multi-page TIFF)
+            icc_profile = None
+            multi_frame_info = None
+            try:
+                with Image.open(image_path) as orig_pil:
+                    icc_profile = orig_pil.info.get("icc_profile")
+                    n_frames = getattr(orig_pil, "n_frames", 1)
+                    if n_frames > 1 and getattr(orig_pil, "format", "") in ("GIF", "TIFF"):
+                        multi_frame_info = {
+                            "n_frames": n_frames,
+                            "duration": orig_pil.info.get("duration", 100),
+                            "loop": orig_pil.info.get("loop", 0),
+                            "format": orig_pil.format
+                        }
+            except Exception:
+                pass
+
+            if action == "clean" and multi_frame_info and multi_frame_info["n_frames"] > 1:
+                try:
+                    with Image.open(image_path) as src_multi:
+                        dur = multi_frame_info["duration"]
+                        loop_val = multi_frame_info["loop"]
+                        cleaned_pil_frames = []
+                        n_tot = multi_frame_info["n_frames"]
+
+                        for f_idx, frame in enumerate(ImageSequence.Iterator(src_multi)):
+                            if cancel_check and cancel_check():
+                                return ProcessResult(success=False, action=action, message="Task cancelled by user.", cancelled=True)
+                            _report(10 + int((f_idx / n_tot) * 75), f"Cleaning frame {f_idx + 1}/{n_tot}...")
+
+                            f_conv = frame.convert("RGBA")
+                            arr = cv2.cvtColor(np.array(f_conv), cv2.COLOR_RGBA2BGRA)
+                            if "LSB" in methods:
+                                arr[:, :, :3] = process_lsb(arr[:, :, :3], aggressiveness, "clean", cancel_check=cancel_check)
+                            f_rgb = cv2.cvtColor(arr, cv2.COLOR_BGRA2RGBA)
+                            cleaned_pil_frames.append(Image.fromarray(f_rgb))
+
+                        out_path_used = _resolve_output_path(image_path, output_path, force_jpeg=False, rand_name=rand_name)
+                        out_ext = os.path.splitext(out_path_used)[1].lower()
+                        if out_ext in (".gif", ".tiff", ".tif"):
+                            out_dir = os.path.dirname(os.path.abspath(out_path_used))
+                            tmp_token = secrets.token_hex(4)
+                            tmp_path = os.path.join(out_dir, f".tmp_{tmp_token}_{os.path.basename(out_path_used)}")
+                            cleaned_pil_frames[0].save(
+                                tmp_path,
+                                save_all=True,
+                                append_images=cleaned_pil_frames[1:],
+                                duration=dur,
+                                loop=loop_val
+                            )
+                            os.replace(tmp_path, out_path_used)
+                            _report(100, "Clean complete")
+                            return ProcessResult(
+                                success=True,
+                                action=action,
+                                message=f"Cleaned {n_tot}-frame image saved to:\n{out_path_used}",
+                                output_path=out_path_used
+                            )
+                except Exception:
+                    pass
+
             raw_img, load_err = load_image_checked(image_path, cv2.IMREAD_UNCHANGED)
             if raw_img is None:
                 return ProcessResult(success=False, action=action, message=load_err)
@@ -349,6 +431,7 @@ class WatermarkProcessor:
                 "DWT": process_dwt
             }
 
+            any_freq_detected = False
             for idx, m_name in enumerate(freq_methods):
                 if cancel_check and cancel_check():
                     return ProcessResult(success=False, action=action, message="Task cancelled by user.", cancelled=True)
@@ -356,9 +439,20 @@ class WatermarkProcessor:
                 _report(step_pct, f"Filtering {m_name} artifacts...")
 
                 fn = freq_algo_map[m_name]
-                current_channel = fn(current_channel, aggressiveness, "clean", cancel_check=cancel_check)
-                if current_channel is None:
-                    return ProcessResult(success=False, action=action, message="Task cancelled by user.", cancelled=True)
+                # Pre-detection dynamic linkage: in Conservative & Balanced modes, only clean if watermark anomaly detected
+                needs_clean = (aggressiveness == "Aggressive")
+                if not needs_clean:
+                    det = fn(current_channel, aggressiveness, "detect", cancel_check=cancel_check)
+                    if det and det.get("detected"):
+                        needs_clean = True
+                        any_freq_detected = True
+                else:
+                    any_freq_detected = True
+
+                if needs_clean:
+                    current_channel = fn(current_channel, aggressiveness, "clean", cancel_check=cancel_check)
+                    if current_channel is None:
+                        return ProcessResult(success=False, action=action, message="Task cancelled by user.", cancelled=True)
 
             if cancel_check and cancel_check():
                 return ProcessResult(success=False, action=action, message="Task cancelled by user.", cancelled=True)
@@ -368,7 +462,7 @@ class WatermarkProcessor:
                 if aggressiveness == "Aggressive":
                     cr_channel = cv2.GaussianBlur(cr_channel, (3, 3), 0)
                     cb_channel = cv2.GaussianBlur(cb_channel, (3, 3), 0)
-                elif aggressiveness == "Balanced":
+                elif aggressiveness == "Balanced" and any_freq_detected:
                     cr_channel = cv2.medianBlur(cr_channel, 3)
                     cb_channel = cv2.medianBlur(cb_channel, 3)
 
@@ -392,18 +486,33 @@ class WatermarkProcessor:
                 if cancel_check and cancel_check():
                     return ProcessResult(success=False, action=action, message="Task cancelled by user.", cancelled=True)
                 _report(85, "Neutralizing spatial LSB planes...")
-                if len(result_img.shape) == 3:
-                    channels = list(cv2.split(result_img))
-                    for c_idx in range(len(channels)):
-                        cleaned_ch = process_lsb(channels[c_idx], aggressiveness, "clean", cancel_check=cancel_check)
-                        if cleaned_ch is None:
+
+                needs_lsb_clean = (aggressiveness == "Aggressive")
+                if not needs_lsb_clean:
+                    if len(result_img.shape) == 3:
+                        for c_idx in range(result_img.shape[2]):
+                            det_l = process_lsb(result_img[:, :, c_idx], aggressiveness, "detect", cancel_check=cancel_check)
+                            if det_l and det_l.get("detected"):
+                                needs_lsb_clean = True
+                                break
+                    else:
+                        det_l = process_lsb(result_img, aggressiveness, "detect", cancel_check=cancel_check)
+                        if det_l and det_l.get("detected"):
+                            needs_lsb_clean = True
+
+                if needs_lsb_clean:
+                    if len(result_img.shape) == 3:
+                        channels = list(cv2.split(result_img))
+                        for c_idx in range(len(channels)):
+                            cleaned_ch = process_lsb(channels[c_idx], aggressiveness, "clean", cancel_check=cancel_check)
+                            if cleaned_ch is None:
+                                return ProcessResult(success=False, action=action, message="Task cancelled by user.", cancelled=True)
+                            channels[c_idx] = cleaned_ch
+                        result_img = cv2.merge(channels)
+                    else:
+                        result_img = process_lsb(result_img, aggressiveness, "clean", cancel_check=cancel_check)
+                        if result_img is None:
                             return ProcessResult(success=False, action=action, message="Task cancelled by user.", cancelled=True)
-                        channels[c_idx] = cleaned_ch
-                    result_img = cv2.merge(channels)
-                else:
-                    result_img = process_lsb(result_img, aggressiveness, "clean", cancel_check=cancel_check)
-                    if result_img is None:
-                        return ProcessResult(success=False, action=action, message="Task cancelled by user.", cancelled=True)
 
             if cancel_check and cancel_check():
                 return ProcessResult(success=False, action=action, message="Task cancelled by user.", cancelled=True)
@@ -422,7 +531,7 @@ class WatermarkProcessor:
             out_path_used = _resolve_output_path(image_path, output_path, force_jpeg, rand_name)
 
             _report(94, "Writing output image...")
-            save_ok = imwrite_unicode(out_path_used, result_img)
+            save_ok = imwrite_unicode(out_path_used, result_img, icc_profile=icc_profile)
             if not save_ok:
                 raise RuntimeError(f"Failed to write image to [{out_path_used}]. Check directory write permissions.")
 

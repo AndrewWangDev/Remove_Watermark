@@ -189,11 +189,31 @@ def process_fft(img_channel, mode, action="clean", cancel_check=None):
     spikes = valid_mask & (magnitude_spectrum > threshold)
     spike_count = int(np.sum(spikes))
     min_spikes = 4 if mode == "Conservative" else (2 if mode == "Balanced" else 1)
-    detected = bool(spike_count >= min_spikes)
+
+    # Analyze angular orientation distribution of detected spikes
+    # A single 1D directional periodic grating (e.g. blinds, fabric) has spikes along ONLY 1 orientation axis
+    # Artificial digital watermarks (spread-spectrum, multi-carrier, 2D grid) span at least 2 distinct orientation axes
+    num_axes = 0
+    if spike_count >= 2:
+        coords = np.argwhere(spikes)
+        dy = coords[:, 0] - crow
+        dx = coords[:, 1] - ccol
+        angles = np.mod(np.arctan2(dy, dx), np.pi)
+        hist, _ = np.histogram(angles, bins=18, range=(0, np.pi))
+        num_axes = int(np.sum(hist > 0))
+
+    if mode == "Aggressive":
+        detected = bool(spike_count >= min_spikes)
+    elif mode == "Conservative":
+        detected = bool(spike_count >= min_spikes and num_axes >= 2)
+    else:  # Balanced
+        detected = bool(spike_count >= min_spikes and (num_axes >= 2 or spike_count >= 16))
 
     if action == "detect":
         max_val = float(np.max(valid_vals))
         snr_score = max(0.0, max_val - mean_val)
+        if num_axes <= 1 and spike_count >= 2:
+            snr_score = snr_score * 0.25
         return {"detected": detected, "score": float(round(snr_score, 2))}
 
     if action == "clean":
